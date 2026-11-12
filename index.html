@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dance Rush '16</title>
+<meta name="description" content="Strike the pose. A webcam dance game with a machine-learning model that runs entirely in your browser.">
+<style>
+  html, body { margin: 0; height: 100%; background: #2e085c; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { width: min(100vw, calc(100vh * 1120 / 720)); height: auto; aspect-ratio: 1120 / 720; display: block; cursor: pointer; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="1120" height="720" aria-label="Dance Rush '16 game"></canvas>
+<video id="cam" playsinline muted style="display:none"></video>
+
+<script src="core.js"></script>
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/vision_bundle.mjs";
+
+const WASM_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm";
+const POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+const { MOTION_JOINTS, normalizeLandmarks, sequenceFeatures, predictProba } = window.DanceCore;
+
+// ---- Settings (same values as settings.py) ----
+const params = new URLSearchParams(location.search);
+const CFG = {
+  rounds: 8, total: 65, perDance: 7.5, window: 1.6, streak: 0.45, getReady: 3,
+  threshold: Math.min(1, Math.max(0.05, parseFloat(params.get("threshold")) || 0.6)),
+};
+
+// ---- Layout + palette (same as the Python game) ----
+const W = 1120, H = 720;
+const CAM_X = 22, CAM_Y = 128, CAM_W = 708, CAM_H = 531;
+const PANEL_X = 750, PANEL_W = 347;
+const WHITE = "#fff", INK = "#2e085c", PANEL = "#461490", MUTED = "#decaff", DIM = "#7d4bc3";
+const PINK = "#ff40a0", YELLOW = "#ffe200", CYAN = "#00e5ff", GREEN = "#39e678", RED = "#ff4854", ORANGE = "#ff9600";
+const F = {
+  huge: '64px Impact, "Arial Black", sans-serif',
+  h1: '44px Impact, "Arial Black", sans-serif',
+  h2: '30px Impact, "Arial Black", sans-serif',
+  small: 'bold 19px "Arial Black", "Segoe UI", sans-serif',
+  tiny: 'bold 15px "Segoe UI", system-ui, sans-serif',
+};
+const SKELETON = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[25,27],[24,26],[26,28],[27,31],[28,32]];
+
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("cam");
+
+// ---- Drawing helpers ----
+function rrect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function box(x, y, w, h, r, fill, border, bw = 4, alpha = 1) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  rrect(x, y, w, h, r);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  ctx.restore();
+  if (border) { rrect(x + bw / 2, y + bw / 2, w - bw, h - bw, Math.max(0, r - bw / 2)); ctx.lineWidth = bw; ctx.strokeStyle = border; ctx.stroke(); }
+}
+function text(s, x, y, font, color = WHITE, o = {}) {
+  const { outline = INK, width = 3, align = "left" } = o;
+  ctx.font = font; ctx.textAlign = align; ctx.textBaseline = "top"; ctx.lineJoin = "round";
+  if (outline) { ctx.lineWidth = width * 2; ctx.strokeStyle = outline; ctx.strokeText(s, x, y); }
+  ctx.fillStyle = color; ctx.fillText(s, x, y);
+}
+function pop(s, cx, cy, font, color, scale = 1, alpha = 1) {
+  ctx.save();
+  ctx.translate(cx, cy); ctx.scale(scale, scale); ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.font = font; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.lineJoin = "round";
+  ctx.lineWidth = 8; ctx.strokeStyle = INK; ctx.strokeText(s, 0, 0);
+  ctx.fillStyle = color; ctx.fillText(s, 0, 0);
+  ctx.restore();
+}
+function bar(x, y, w, h, ratio, fill) {
+  box(x, y, w, h, h / 2, INK, null);
+  const inner = Math.round((w - 6) * Math.max(0, Math.min(1, ratio)));
+  if (inner > 0) box(x + 3, y + 3, Math.max(inner, h - 6), h - 6, (h - 6) / 2, fill, null);
+  box(x, y, w, h, h / 2, null, WHITE, 3);
+}
+let bgCanvas = null;
+function background() {
+  if (bgCanvas) return bgCanvas;
+  bgCanvas = document.createElement("canvas"); bgCanvas.width = W; bgCanvas.height = H;
+  const b = bgCanvas.getContext("2d");
+  const g = b.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "rgb(112,24,214)"); g.addColorStop(1, "rgb(255,70,140)");
+  b.fillStyle = g; b.fillRect(0, 0, W, H);
+  b.fillStyle = "rgba(255,255,255,0.08)";
+  for (let x = -H; x < W; x += 90) {
+    b.beginPath(); b.moveTo(x, H); b.lineTo(x + 45, H); b.lineTo(x + 45 + H, 0); b.lineTo(x + H, 0); b.closePath(); b.fill();
+  }
+  return bgCanvas;
+}
+function rating(correct) {
+  const r = correct / CFG.rounds;
+  if (correct === CFG.rounds) return ["S", YELLOW];
+  if (r >= 0.75) return ["A", GREEN];
+  if (r >= 0.5) return ["B", CYAN];
+  if (r >= 0.25) return ["C", ORANGE];
+  return ["D", RED];
+}
+
+// ---- Game logic (port of DanceGame in game.py) ----
+class DanceGame {
+  constructor(model, names, threshold) {
+    this.model = model; this.names = names; this.threshold = threshold;
+    this.state = "idle";
+    this.buffer = [];
+    this.reset();
+  }
+  reset() {
+    this.matchSince = null; this.prediction = "WARMING UP"; this.confidence = 0;
+    this.roundIdx = 0; this.correct = 0; this.missed = 0; this.score = 0; this.combo = 0;
+    this.startTime = 0; this.roundStart = 0; this.order = []; this.lastMessage = "";
+    this.results = []; this.flashKind = null; this.flashStart = -99; this.lastPoints = 0;
+  }
+  start(now) {
+    this.reset();
+    this.state = "playing"; this.startTime = now;
+    this.order = this.makeOrder();
+    this.resetRound(now);
+    this.lastMessage = "GO!";
+  }
+  makeOrder() {
+    const order = [];
+    while (order.length < CFG.rounds) {
+      const batch = this.names.slice();
+      for (let i = batch.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [batch[i], batch[j]] = [batch[j], batch[i]]; }
+      if (order.length && batch.length > 1 && order[order.length - 1] === batch[0]) batch.push(batch.shift());
+      order.push(...batch);
+    }
+    return order.slice(0, CFG.rounds);
+  }
+  resetRound(now) {
+    this.roundStart = now; this.buffer = []; this.matchSince = null;
+    this.prediction = "WARMING UP"; this.confidence = 0;
+  }
+  get target() { return this.roundIdx < this.order.length ? this.order[this.roundIdx] : null; }
+  advance(now, success) {
+    this.results.push(success); this.flashStart = now;
+    if (success) {
+      this.correct++; this.combo++;
+      const quickness = Math.max(0, 1 - (now - this.roundStart) / CFG.perDance);
+      this.lastPoints = 100 + Math.floor(100 * quickness) + 25 * Math.max(0, this.combo - 1);
+      this.score += this.lastPoints; this.lastMessage = "CORRECT!"; this.flashKind = "good";
+    } else {
+      this.missed++; this.combo = 0; this.lastPoints = 0; this.lastMessage = "MISSED!"; this.flashKind = "bad";
+    }
+    this.roundIdx++;
+    if (this.roundIdx >= CFG.rounds || now - this.startTime >= CFG.total) { this.state = "done"; return; }
+    this.resetRound(now);
+  }
+  update(now, pose) {
+    if (this.state !== "playing") return;
+    if (now - this.startTime >= CFG.total) {
+      this.missed += CFG.rounds - this.roundIdx; this.state = "done"; this.lastMessage = "TIME UP!"; return;
+    }
+    if (now - this.roundStart >= CFG.perDance) { this.advance(now, false); return; }
+    if (!pose) { this.buffer = []; this.matchSince = null; this.prediction = "BODY NOT VISIBLE"; this.confidence = 0; return; }
+    this.buffer.push([now, pose]);
+    while (this.buffer.length && now - this.buffer[0][0] > CFG.window) this.buffer.shift();
+    if (this.buffer.length < 6 || now - this.buffer[0][0] < CFG.window * 0.85) { this.prediction = "WATCHING..."; return; }
+    const feats = sequenceFeatures(this.buffer.map((b) => b[0]), this.buffer.map((b) => b[1]));
+    if (!feats) { this.prediction = "WATCHING..."; return; }
+    const proba = predictProba(this.model, feats);
+    let best = 0; proba.forEach((p, i) => { if (p > proba[best]) best = i; });
+    this.prediction = this.model.classes[best]; this.confidence = proba[best];
+    if (this.prediction === this.target && this.confidence >= this.threshold) {
+      if (this.matchSince === null) this.matchSince = now;
+      if (now - this.matchSince >= CFG.streak) this.advance(now, true);
+    } else {
+      this.matchSince = null;
+    }
+  }
+}
+
+// ---- App state ----
+// phase: menu -> loading -> countdown -> playing -> done   (error on failure)
+let phase = "menu", errorMsg = "", countdownStart = 0;
+let game = null, model = null, landmarker = null, camReady = false;
+let mirror = document.createElement("canvas"), mctx = mirror.getContext("2d");
+let curPose = null, curLandmarks = null, lastTs = -1, lastVideoTime = -1;
+const names = () => (model ? model.names : {});
+const dispName = (k) => (model && model.names[k]) || k;
+
+// Fetch the trained classifier right away so the dance list shows on the menu.
+const modelPromise = fetch("model.json").then((r) => { if (!r.ok) throw new Error("model.json failed to load"); return r.json(); });
+modelPromise.then((m) => { model = m; }).catch(() => {});
+
+async function init() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This browser can't use a camera here. Try desktop Chrome or Edge on the https link.");
+  const modelP = modelPromise;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }, audio: false });
+  } catch (e) {
+    throw new Error("Camera blocked. Allow camera access in your browser, then click to try again.");
+  }
+  video.srcObject = stream;
+  await video.play();
+  const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+  const make = (delegate) => PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: POSE_MODEL_URL, delegate },
+    runningMode: "VIDEO", numPoses: 1,
+    minPoseDetectionConfidence: 0.5, minTrackingConfidence: 0.5,
+  });
+  try { landmarker = await make("GPU"); } catch (e) { landmarker = await make("CPU"); }
+  model = await modelP;
+  const dances = model.classes.filter((c) => c !== "other");
+  game = new DanceGame(model, dances, CFG.threshold);
+  camReady = true;
+}
+
+async function begin() {
+  if (phase === "done") { startCountdown(); return; }
+  if (phase !== "menu" && phase !== "error") return;
+  if (camReady) { startCountdown(); return; }
+  phase = "loading";
+  try { await init(); startCountdown(); }
+  catch (e) { console.error(e); errorMsg = e.message || String(e); phase = "error"; }
+}
+function startCountdown() { game.state = "idle"; phase = "countdown"; countdownStart = performance.now() / 1000; }
+
+addEventListener("keydown", (e) => {
+  if (e.code === "Space") { e.preventDefault(); if (phase === "menu" || phase === "error") begin(); }
+  if (e.key === "r" || e.key === "R") { if (camReady && phase !== "loading") startCountdown(); }
+});
+canvas.addEventListener("pointerdown", () => { if (phase === "menu" || phase === "error" || phase === "done") begin(); });
+
+// ---- Per-frame pose tracking (mirrors the video first, exactly like the Python cv2.flip) ----
+function track() {
+  if (!camReady || video.readyState < 2 || video.videoWidth === 0) return;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (mirror.width !== vw || mirror.height !== vh) { mirror.width = vw; mirror.height = vh; }
+  mctx.setTransform(-1, 0, 0, 1, vw, 0);
+  mctx.drawImage(video, 0, 0, vw, vh);
+  mctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (video.currentTime === lastVideoTime) return; // no new camera frame yet
+  lastVideoTime = video.currentTime;
+  const ts = Math.max(Math.round(performance.now()), lastTs + 1); lastTs = ts;
+  const res = landmarker.detectForVideo(mirror, ts);
+  if (!res.landmarks || !res.landmarks.length) { curPose = null; curLandmarks = null; return; }
+  const pts = res.landmarks[0];
+  curLandmarks = pts;
+  const visible = MOTION_JOINTS.filter((i) => (pts[i].visibility ?? 1) > 0.4).length;
+  curPose = visible < 8 ? null : normalizeLandmarks(pts, vw / vh);
+}
+
+// ---- Rendering ----
+function drawCamera(border) {
+  if (camReady && mirror.width) {
+    const vw = mirror.width, vh = mirror.height;
+    const s = Math.max(CAM_W / vw, CAM_H / vh);
+    const sw = CAM_W / s, sh = CAM_H / s, sx = (vw - sw) / 2, sy = (vh - sh) / 2;
+    ctx.drawImage(mirror, sx, sy, sw, sh, CAM_X, CAM_Y, CAM_W, CAM_H);
+    if (curLandmarks) {
+      const P = (p) => [CAM_X + (p.x * vw - sx) * s, CAM_Y + (p.y * vh - sy) * s];
+      ctx.lineWidth = 4; ctx.strokeStyle = "rgb(255,220,65)"; ctx.lineCap = "round";
+      for (const [a, b] of SKELETON) {
+        const pa = curLandmarks[a], pb = curLandmarks[b];
+        if ((pa.visibility ?? 1) < 0.4 || (pb.visibility ?? 1) < 0.4) continue;
+        const [x1, y1] = P(pa), [x2, y2] = P(pb);
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+      ctx.fillStyle = "rgb(255,105,230)";
+      for (const i of MOTION_JOINTS) {
+        if ((curLandmarks[i].visibility ?? 1) <= 0.4) continue;
+        const [x, y] = P(curLandmarks[i]); ctx.beginPath(); ctx.arc(x, y, 5, 0, 7); ctx.fill();
+      }
+    }
+  } else {
+    ctx.fillStyle = INK; ctx.fillRect(CAM_X, CAM_Y, CAM_W, CAM_H);
+  }
+  box(CAM_X - 4, CAM_Y - 4, CAM_W + 8, CAM_H + 8, 10, null, INK, 4);
+  box(CAM_X - 3, CAM_Y - 3, CAM_W + 6, CAM_H + 6, 8, null, border, 6);
+}
+function drawProgress() {
+  const gap = 8, w = Math.floor((CAM_W - gap * (CFG.rounds - 1)) / CFG.rounds);
+  for (let i = 0; i < CFG.rounds; i++) {
+    const x = CAM_X + i * (w + gap);
+    let col = DIM;
+    if (game && i < game.results.length) col = game.results[i] ? GREEN : RED;
+    else if (game && game.state === "playing" && i === game.roundIdx) col = YELLOW;
+    box(x, 90, w, 24, 12, col, WHITE, 3);
+  }
+}
+function drawChips(x, w, y0) {
+  const list = model ? model.classes.filter((c) => c !== "other") : [];
+  const chipW = Math.floor((w - 38 - 10) / 2);
+  list.forEach((n, i) => {
+    const cx = x + 19 + (i % 2) * (chipW + 10), cy = y0 + Math.floor(i / 2) * 42;
+    box(cx, cy, chipW, 34, 17, PINK, WHITE, 3);
+    text(dispName(n), cx + chipW / 2, cy + 8, F.tiny, WHITE, { width: 2, align: "center" });
+  });
+}
+
+function draw(now) {
+  const pulse = 0.5 + 0.5 * Math.sin(now * 6);
+  ctx.drawImage(background(), 0, 0);
+  text("DANCE RUSH '16", 22, 8, F.h1, YELLOW, { width: 4 });
+  text("SCORE", 1098, 6, F.tiny, MUTED, { outline: null, align: "right" });
+  text((game ? game.score : 0).toLocaleString("en-US"), 1098, 22, F.h1, WHITE, { width: 4, align: "right" });
+  drawProgress();
+
+  const g = game;
+  const flashAge = g ? now - g.flashStart : 99;
+  const flashing = !!(g && phase === "playing" && g.flashKind && flashAge < 0.8);
+  let border = WHITE;
+  if (flashing) border = g.flashKind === "good" ? GREEN : RED;
+  else if (phase === "playing" && g.matchSince !== null) border = YELLOW;
+  drawCamera(border);
+
+  const x = PANEL_X, w = PANEL_W, cx = x + w / 2;
+  box(x, 128, w, 531, 18, PANEL, WHITE, 4, 0.88);
+
+  if (phase === "menu" || phase === "loading" || phase === "error" || phase === "countdown") {
+    text("READY?", cx, 144, F.huge, YELLOW, { width: 5, align: "center" });
+    text(`${CFG.rounds} MOVES  /  ${CFG.total} SECONDS`, cx, 214, F.small, WHITE, { outline: null, align: "center" });
+    text(`${CFG.perDance}s PER MOVE`, cx, 246, F.tiny, MUTED, { outline: null, align: "center" });
+    drawChips(x, w, 282);
+    const btn = [x + 19, 566, w - 38, 70];
+    if (phase === "menu" || phase === "error") {
+      box(...btn, 35, GREEN, WHITE, 5);
+      text("PLAY NOW!", cx, 578 - 3 * pulse, F.h1, WHITE, { width: 4, align: "center" });
+      text("click or press SPACE", cx, 640, F.tiny, MUTED, { outline: null, align: "center" });
+    } else if (phase === "loading") {
+      box(...btn, 35, ORANGE, WHITE, 5);
+      text("LOADING" + ".".repeat(1 + Math.floor(now * 3) % 3), cx, 580, F.h1, WHITE, { width: 4, align: "center" });
+      text("allow the camera when asked", cx, 640, F.tiny, MUTED, { outline: null, align: "center" });
+    } else {
+      box(...btn, 35, YELLOW, WHITE, 5);
+      text("GET READY!", cx, 580, F.h1, INK, { outline: null, align: "center" });
+    }
+    // Camera-area caption
+    if (phase === "menu" || phase === "loading" || phase === "error") {
+      const lines = phase === "error" ? ["CAMERA PROBLEM", errorMsg]
+        : phase === "loading" ? ["STARTING CAMERA + POSE MODEL..."]
+        : ["YOUR CAMERA SHOWS HERE", "Everything runs in your browser. No video is uploaded."];
+      text(lines[0], CAM_X + CAM_W / 2, CAM_Y + 200, F.h2, phase === "error" ? RED : YELLOW, { align: "center" });
+      if (lines[1]) {
+        // wrap long messages
+        const words = lines[1].split(" "); let line = "", yy = CAM_Y + 250;
+        ctx.font = F.small;
+        for (const wd of words) {
+          if (ctx.measureText(line + wd).width > CAM_W - 80) { text(line.trim(), CAM_X + CAM_W / 2, yy, F.small, WHITE, { outline: null, align: "center" }); yy += 28; line = ""; }
+          line += wd + " ";
+        }
+        text(line.trim(), CAM_X + CAM_W / 2, yy, F.small, WHITE, { outline: null, align: "center" });
+      }
+    } else {
+      box(CAM_X + 14, CAM_Y + CAM_H - 70, CAM_W - 28, 56, 14, INK, WHITE, 3, 0.85);
+      text("STEP BACK - SHOW HEAD TO TOE", CAM_X + CAM_W / 2, CAM_Y + CAM_H - 62, F.h2, YELLOW, { align: "center" });
+      const left = Math.max(0, CFG.getReady - (now - countdownStart));
+      pop(String(Math.ceil(left)), CAM_X + CAM_W / 2, CAM_Y + CAM_H / 2 - 20, '200px Impact, "Arial Black", sans-serif', PINK, 1 + 0.25 * (left % 1), 1);
+    }
+  } else if (phase === "playing") {
+    box(CAM_X + 14, CAM_Y + 14, CAM_W - 28, 104, 18, PINK, WHITE, 5, 0.92);
+    text("DO THIS MOVE!", CAM_X + CAM_W / 2, CAM_Y + 20, F.tiny, WHITE, { outline: null, align: "center" });
+    text(dispName(g.target), CAM_X + CAM_W / 2, CAM_Y + 42, F.huge, YELLOW, { width: 5, align: "center" });
+
+    const totalLeft = Math.max(0, CFG.total - (now - g.startTime));
+    const roundLeft = Math.max(0, CFG.perDance - (now - g.roundStart));
+    const urgent = roundLeft <= 2;
+    text(`ROUND ${g.roundIdx + 1} / ${CFG.rounds}`, cx, 140, F.h2, WHITE, { align: "center" });
+    text(roundLeft.toFixed(1), cx, 172, F.huge, urgent ? RED : WHITE, { width: 5, align: "center" });
+    bar(x + 19, 262, w - 38, 22, roundLeft / CFG.perDance, urgent ? RED : CYAN);
+
+    const matches = g.prediction === g.target;
+    text("WE SEE YOU DOING", cx, 306, F.tiny, MUTED, { outline: null, align: "center" });
+    text(dispName(g.prediction), cx, 322, F.h2, matches ? GREEN : WHITE, { align: "center" });
+
+    text("MATCH POWER", x + 19, 376, F.tiny, MUTED, { outline: null });
+    text(`${Math.round(g.confidence * 100)}%`, x + w - 19, 376, F.tiny, WHITE, { outline: null, align: "right" });
+    const ok = matches && g.confidence >= g.threshold;
+    bar(x + 19, 398, w - 38, 28, g.confidence, ok ? GREEN : matches ? YELLOW : DIM);
+    const mark = x + 19 + (w - 38) * g.threshold;
+    ctx.fillStyle = WHITE; ctx.fillRect(mark - 2, 392, 4, 40);
+    let hint = "KEEP GOING...", hc = MUTED;
+    if (ok) { hint = "HOLD IT!"; hc = GREEN; }
+    else if (matches) { hint = "ALMOST - DO IT BIGGER!"; hc = YELLOW; }
+    else if (g.prediction === "BODY NOT VISIBLE") { hint = "STEP BACK INTO FRAME"; hc = RED; }
+    text(hint, cx, 438, F.small, hc, { align: "center" });
+
+    text(`COMBO x${g.combo}`, cx, 478, F.h1, g.combo >= 2 ? YELLOW : MUTED, { width: 4, align: "center" });
+    text(`HIT ${g.correct}    MISS ${g.missed}`, cx, 536, F.small, WHITE, { align: "center" });
+    text(`TIME LEFT ${Math.round(totalLeft)}s`, cx, 576, F.small, CYAN, { align: "center" });
+    text("R: RESTART", cx, 625, F.tiny, MUTED, { outline: null, align: "center" });
+
+    if (flashing) {
+      const fade = 1 - flashAge / 0.8, good = g.flashKind === "good";
+      ctx.save(); ctx.globalAlpha = 0.43 * fade; ctx.fillStyle = good ? GREEN : RED; ctx.fillRect(CAM_X, CAM_Y, CAM_W, CAM_H); ctx.restore();
+      const sc = 1 + 0.5 * Math.max(0, 1 - flashAge / 0.25);
+      pop(good ? "CORRECT!" : "MISSED!", CAM_X + CAM_W / 2, CAM_Y + CAM_H / 2 + 20, F.huge, good ? GREEN : RED, sc, Math.min(1, fade * 1.6));
+      if (good) pop(`+${g.lastPoints}`, CAM_X + CAM_W / 2, CAM_Y + CAM_H / 2 + 90, F.h1, YELLOW, 1, Math.min(1, fade * 1.6));
+    }
+  } else if (phase === "done") {
+    const [grade, gc] = rating(g.correct);
+    text(g.lastMessage === "TIME UP!" ? "TIME'S UP!" : "GAME OVER", cx, 140, F.h1, WHITE, { width: 4, align: "center" });
+    ctx.beginPath(); ctx.arc(cx, 268, 72, 0, 7); ctx.fillStyle = INK; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, 268, 65, 0, 7); ctx.fillStyle = gc; ctx.fill();
+    ctx.beginPath(); ctx.arc(cx, 268, 69, 0, 7); ctx.lineWidth = 6; ctx.strokeStyle = WHITE; ctx.stroke();
+    pop(grade, cx, 272, F.huge, WHITE, 1.6);
+    text("FINAL SCORE", cx, 358, F.small, MUTED, { outline: null, align: "center" });
+    text(g.score.toLocaleString("en-US"), cx, 382, F.h1, YELLOW, { width: 4, align: "center" });
+    text(`${g.correct} / ${CFG.rounds} CORRECT`, cx, 446, F.h2, GREEN, { align: "center" });
+    text(`MISSED ${g.missed}`, cx, 492, F.small, WHITE, { align: "center" });
+    box(x + 19, 556, w - 38, 70, 35, PINK, WHITE, 5);
+    text("PLAY AGAIN", cx, 568 - 3 * pulse, F.h1, WHITE, { width: 4, align: "center" });
+    text("click or press R", cx, 640, F.tiny, MUTED, { outline: null, align: "center" });
+  }
+
+  text("Privacy: your camera video stays on your device. Everything runs in your browser; nothing is uploaded.", 22, 684, F.tiny, MUTED, { outline: null });
+}
+
+// ---- Main loop ----
+function frame() {
+  const now = performance.now() / 1000;
+  try {
+    track();
+    if (phase === "countdown" && now - countdownStart >= CFG.getReady) { game.start(now); phase = "playing"; }
+    if (phase === "playing") { game.update(now, curPose); if (game.state === "done") phase = "done"; }
+    draw(now);
+  } catch (e) { console.error(e); errorMsg = e.message || String(e); phase = "error"; camReady = camReady && !!landmarker; }
+  requestAnimationFrame(frame);
+}
+window.__dr = { get game() { return game; }, get phase() { return phase; }, set phase(p) { phase = p; }, set landmarks(l) { curLandmarks = l; } };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
